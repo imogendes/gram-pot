@@ -1,0 +1,1935 @@
+diff -ruN a/submodules/AccountContext/Sources/GramPotGiftScreen.swift b/submodules/AccountContext/Sources/GramPotGiftScreen.swift
+--- a/submodules/AccountContext/Sources/GramPotGiftScreen.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/AccountContext/Sources/GramPotGiftScreen.swift	2026-10-23 15:21:59.589214294 +0000
+@@ -0,0 +1,9 @@
++import Foundation
++import TelegramCore
++
++/// Gift sheet that can remember the private group a collectible was opened from.
++/// `OpenResolvedUrl` talks to this protocol so it does not need a new `makeGiftViewScreen` parameter.
++public protocol GramPotGiftScreen: AnyObject {
++    func gramPotSetOrigin(groupPeerId: EnginePeer.Id, messageId: EngineMessage.Id?, recipientId: EnginePeer.Id?)
++    func gramPotSetDelivery(contributorNames: [String], viewerName: String)
++}
+diff -ruN a/submodules/TelegramCore/Sources/SyncCore/GramPotMessageAttribute.swift b/submodules/TelegramCore/Sources/SyncCore/GramPotMessageAttribute.swift
+--- a/submodules/TelegramCore/Sources/SyncCore/GramPotMessageAttribute.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramCore/Sources/SyncCore/GramPotMessageAttribute.swift	2026-10-23 15:21:59.597214289 +0000
+@@ -0,0 +1,95 @@
++import Foundation
++import Postbox
++
++/// Card attached to a local message: the pot in the group, or the preview of the gift Jack receives.
++/// The verified Telegram account message (peer 777000) is produced by the server. This attribute is how our client draws the card.
++public final class GramPotMessageAttribute: Equatable, MessageAttribute {
++    public enum Kind: Int32 {
++        case pot = 0
++        case deliveredGift = 1
++    }
++
++    public let potId: Int64
++    public let kind: Kind
++    public let priceNano: Int64
++    public let contributedNano: Int64
++    public let recipientName: String
++    public let contributorNames: [String]
++    public let giftTitle: String
++    public let model: String
++    public let backdrop: String
++    public let symbol: String
++
++    public init(
++        potId: Int64,
++        kind: Kind,
++        priceNano: Int64,
++        contributedNano: Int64,
++        recipientName: String,
++        contributorNames: [String],
++        giftTitle: String,
++        model: String,
++        backdrop: String,
++        symbol: String
++    ) {
++        self.potId = potId
++        self.kind = kind
++        self.priceNano = priceNano
++        self.contributedNano = contributedNano
++        self.recipientName = recipientName
++        self.contributorNames = contributorNames
++        self.giftTitle = giftTitle
++        self.model = model
++        self.backdrop = backdrop
++        self.symbol = symbol
++    }
++
++    public required init(decoder: PostboxDecoder) {
++        self.potId = decoder.decodeInt64ForKey("id", orElse: 0)
++        self.kind = Kind(rawValue: decoder.decodeInt32ForKey("k", orElse: 0)) ?? .pot
++        self.priceNano = decoder.decodeInt64ForKey("p", orElse: 0)
++        self.contributedNano = decoder.decodeInt64ForKey("c", orElse: 0)
++        self.recipientName = decoder.decodeStringForKey("r", orElse: "")
++        self.contributorNames = decoder.decodeStringArrayForKey("n")
++        self.giftTitle = decoder.decodeStringForKey("t", orElse: "")
++        self.model = decoder.decodeStringForKey("m", orElse: "")
++        self.backdrop = decoder.decodeStringForKey("b", orElse: "")
++        self.symbol = decoder.decodeStringForKey("s", orElse: "")
++    }
++
++    public func encode(_ encoder: PostboxEncoder) {
++        encoder.encodeInt64(self.potId, forKey: "id")
++        encoder.encodeInt32(self.kind.rawValue, forKey: "k")
++        encoder.encodeInt64(self.priceNano, forKey: "p")
++        encoder.encodeInt64(self.contributedNano, forKey: "c")
++        encoder.encodeString(self.recipientName, forKey: "r")
++        encoder.encodeStringArray(self.contributorNames, forKey: "n")
++        encoder.encodeString(self.giftTitle, forKey: "t")
++        encoder.encodeString(self.model, forKey: "m")
++        encoder.encodeString(self.backdrop, forKey: "b")
++        encoder.encodeString(self.symbol, forKey: "s")
++    }
++
++    public static func ==(lhs: GramPotMessageAttribute, rhs: GramPotMessageAttribute) -> Bool {
++        return lhs.potId == rhs.potId
++            && lhs.kind == rhs.kind
++            && lhs.priceNano == rhs.priceNano
++            && lhs.contributedNano == rhs.contributedNano
++            && lhs.recipientName == rhs.recipientName
++            && lhs.contributorNames == rhs.contributorNames
++            && lhs.giftTitle == rhs.giftTitle
++            && lhs.model == rhs.model
++            && lhs.backdrop == rhs.backdrop
++            && lhs.symbol == rhs.symbol
++    }
++}
++
++private let gramPotAttributeDeclared: Void = {
++    declareEncodable(GramPotMessageAttribute.self, f: { GramPotMessageAttribute(decoder: $0) })
++    return
++}()
++
++/// Called once from `telegramUIDeclareEncodables`. A second call is a no-op.
++public func gramPotDeclareMessageAttribute() {
++    let _ = gramPotAttributeDeclared
++}
+diff -ruN a/submodules/TelegramCore/Sources/TelegramEngine/Payments/GramPotFinish.swift b/submodules/TelegramCore/Sources/TelegramEngine/Payments/GramPotFinish.swift
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Payments/GramPotFinish.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Payments/GramPotFinish.swift	2026-10-23 15:21:59.593214291 +0000
+@@ -0,0 +1,20 @@
++import Foundation
++import Postbox
++import SwiftSignalKit
++
++public enum GramPotFinishError: Equatable {
++    /// `payments.finishGramPot` is not in the published schema. Placeholder only.
++    /// Do not fall back to `buyStarGift`: the wallet was already debited into escrow.
++    case proposedMethodUnavailable
++}
++
++public extension TelegramEngine.Payments {
++    /// Proposed server method. Spends the escrow for `potId` and delivers the collectible to `recipientId`.
++    ///
++    /// This build does not send a TL query. The method number is not assigned.
++    /// Layer: not assigned. Method: `payments.finishGramPot#00000000` flags:# pot_id:long slug:string recipient_id:InputPeer = Updates.
++    func finishGramPot(potId: Int64, slug: String, recipientId: EnginePeer.Id) -> Signal<Never, GramPotFinishError> {
++        let _ = (potId, slug, recipientId)
++        return .fail(.proposedMethodUnavailable)
++    }
++}
+diff -ruN a/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/BUILD b/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/BUILD
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/BUILD	2026-10-23 15:21:59.569214309 +0000
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/BUILD	2026-10-23 15:21:59.637214260 +0000
+@@ -83,6 +83,7 @@
+         "//submodules/TelegramUI/Components/Chat/ChatMessageWallpaperBubbleContentNode",
+         "//submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode",
+         "//submodules/TelegramUI/Components/Chat/ChatMessageGiftOfferBubbleContentNode",
++        "//submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode",
+         "//submodules/TelegramUI/Components/Chat/ChatMessageDisableCopyProtectionBubbleContentNode",
+         "//submodules/TelegramUI/Components/Chat/ChatMessageGiveawayBubbleContentNode",
+         "//submodules/TelegramUI/Components/Chat/ChatMessageJoinedChannelBubbleContentNode",
+diff -ruN a/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/Sources/ChatMessageBubbleItemNode.swift b/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/Sources/ChatMessageBubbleItemNode.swift
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/Sources/ChatMessageBubbleItemNode.swift	2026-10-23 15:21:59.569214309 +0000
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageBubbleItemNode/Sources/ChatMessageBubbleItemNode.swift	2026-10-23 15:21:59.641214257 +0000
+@@ -75,6 +75,7 @@
+ import ChatMessageWallpaperBubbleContentNode
+ import ChatMessageGiftBubbleContentNode
+ import ChatMessageGiftOfferBubbleContentNode
++import ChatMessageGramPotBubbleContentNode
+ import ChatMessageDisableCopyProtectionBubbleContentNode
+ import ChatMessageGiveawayBubbleContentNode
+ import ChatMessageJoinedChannelBubbleContentNode
+@@ -146,6 +147,9 @@
+             } else if let _ = attribute as? PaidStarsMessageAttribute, !addedPriceInfo, message.id.peerId.namespace == Namespaces.Peer.CloudUser {
+                 result.append((message, ChatMessageActionBubbleContentNode.self, itemAttributes, BubbleItemAttributes(isAttachment: false, neighborType: .text, neighborSpacing: .default)))
+                 addedPriceInfo = true
++            } else if let _ = attribute as? GramPotMessageAttribute {
++                result.append((message, ChatMessageGramPotBubbleContentNode.self, itemAttributes, BubbleItemAttributes(isAttachment: false, neighborType: .text, neighborSpacing: .default)))
++                skipText = true
+             }
+         }
+         
+diff -ruN a/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/BUILD b/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/BUILD
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/BUILD	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/BUILD	2026-10-23 15:21:59.645214254 +0000
+@@ -0,0 +1,32 @@
++load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
++
++swift_library(
++    name = "ChatMessageGramPotBubbleContentNode",
++    module_name = "ChatMessageGramPotBubbleContentNode",
++    srcs = glob([
++        "Sources/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++        "//submodules/AsyncDisplayKit",
++        "//submodules/LottieSettings:LottieSettings",
++        "//submodules/Display",
++        "//submodules/SSignalKit/SwiftSignalKit",
++        "//submodules/TelegramCore",
++        "//submodules/Postbox",
++        "//submodules/AccountContext",
++        "//submodules/TelegramPresentationData",
++        "//submodules/TextFormat",
++        "//submodules/ComponentFlow",
++        "//submodules/WallpaperBackgroundNode",
++        "//submodules/TelegramUI/Components/Gifts/GramPotScreen",
++        "//submodules/TelegramUI/Components/Chat/ChatMessageBubbleContentNode",
++        "//submodules/TelegramUI/Components/Chat/ChatMessageItemCommon",
++        "//submodules/TelegramUI/Components/TextNodeWithEntities",
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
+diff -ruN a/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/Sources/ChatMessageGramPotBubbleContentNode.swift b/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/Sources/ChatMessageGramPotBubbleContentNode.swift
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/Sources/ChatMessageGramPotBubbleContentNode.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageGramPotBubbleContentNode/Sources/ChatMessageGramPotBubbleContentNode.swift	2026-10-23 15:21:59.649214251 +0000
+@@ -0,0 +1,136 @@
++import Foundation
++import UIKit
++import AsyncDisplayKit
++import Display
++import Postbox
++import TelegramCore
++import TelegramPresentationData
++import TextFormat
++import AccountContext
++import LottieSettings
++import ComponentFlow
++import WallpaperBackgroundNode
++import TextNodeWithEntities
++import ChatMessageBubbleContentNode
++import ChatMessageItemCommon
++import GramPotScreen
++
++public final class ChatMessageGramPotBubbleContentNode: ChatMessageBubbleContentNode {
++    private var mediaBackgroundContent: WallpaperBubbleBackgroundNode?
++    private let titleNode: TextNode
++    private let detailNode: TextNode
++
++    private var absoluteRect: (CGRect, CGSize)?
++
++    override public var disablesClipping: Bool {
++        return true
++    }
++
++    required public init(lottieSettings: LottieRenderingSettings) {
++        self.titleNode = TextNode()
++        self.titleNode.isUserInteractionEnabled = false
++        self.titleNode.displaysAsynchronously = false
++
++        self.detailNode = TextNode()
++        self.detailNode.isUserInteractionEnabled = false
++        self.detailNode.displaysAsynchronously = false
++
++        super.init(lottieSettings: lottieSettings)
++
++        self.addSubnode(self.titleNode)
++        self.addSubnode(self.detailNode)
++    }
++
++    required public init?(coder aDecoder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    override public func asyncLayoutContent() -> (_ item: ChatMessageBubbleContentItem, _ layoutConstants: ChatMessageItemLayoutConstants, _ preparePosition: ChatMessageBubblePreparePosition, _ messageSelection: Bool?, _ constrainedSize: CGSize, _ avatarInset: CGFloat) -> (ChatMessageBubbleContentProperties, unboundSize: CGSize?, maxWidth: CGFloat, layout: (CGSize, ChatMessageBubbleContentPosition) -> (CGFloat, (CGFloat) -> (CGSize, (ListViewItemUpdateAnimation, Bool, ListViewItemApply?) -> Void))) {
++        let makeTitleLayout = TextNode.asyncLayout(self.titleNode)
++        let makeDetailLayout = TextNode.asyncLayout(self.detailNode)
++
++        return { [weak self] item, _, _, _, _, _ in
++            let contentProperties = ChatMessageBubbleContentProperties(hidesSimpleAuthorHeader: true, headerSpacing: 0.0, hidesBackground: .always, forceFullCorners: false, forceAlignment: .center)
++            return (contentProperties, nil, CGFloat.greatestFiniteMagnitude, { [weak self] _, _ in
++                let cardWidth: CGFloat = 260.0
++                let textColor = serviceMessageColorComponents(theme: item.presentationData.theme.theme, wallpaper: item.presentationData.theme.wallpaper).primaryText
++                let attribute = item.message.attributes.first(where: { $0 is GramPotMessageAttribute }) as? GramPotMessageAttribute
++
++                let title: String
++                let detail: String
++                if let attribute {
++                    switch attribute.kind {
++                    case .deliveredGift:
++                        let count = attribute.contributorNames.count
++                        title = item.presentationData.strings.GramPot_GiftFromFriends("\(count)").string
++                        detail = [attribute.model, attribute.backdrop, attribute.symbol].filter { !$0.isEmpty }.joined(separator: "\n")
++                    case .pot:
++                        title = attribute.giftTitle
++                        let price = gramPotGramText(nano: attribute.priceNano) ?? ""
++                        let contributed = gramPotGramText(nano: attribute.contributedNano) ?? ""
++                        detail = gramPotProgressText(contributed: contributed, price: price) + " GRAM"
++                    }
++                } else {
++                    title = ""
++                    detail = ""
++                }
++
++                let titleString = NSAttributedString(string: title, font: Font.semibold(15.0), textColor: textColor, paragraphAlignment: .center)
++                let detailString = NSAttributedString(string: detail, font: Font.regular(13.0), textColor: textColor, paragraphAlignment: .center)
++                let constrained = CGSize(width: cardWidth - 32.0, height: CGFloat.greatestFiniteMagnitude)
++                let (titleLayout, titleApply) = makeTitleLayout(TextNodeLayoutArguments(attributedString: titleString, backgroundColor: nil, maximumNumberOfLines: 2, truncationType: .end, constrainedSize: constrained, alignment: .center, cutout: nil, insets: UIEdgeInsets()))
++                let (detailLayout, detailApply) = makeDetailLayout(TextNodeLayoutArguments(attributedString: detailString, backgroundColor: nil, maximumNumberOfLines: 6, truncationType: .end, constrainedSize: constrained, alignment: .center, cutout: nil, insets: UIEdgeInsets()))
++
++                let cardHeight = 28.0 + titleLayout.size.height + 8.0 + detailLayout.size.height + 28.0
++                let backgroundSize = CGSize(width: cardWidth, height: cardHeight)
++
++                return (backgroundSize.width, { [weak self] boundingWidth in
++                    return (backgroundSize, { [weak self] animation, _, _ in
++                        guard let strongSelf = self else {
++                            return
++                        }
++                        strongSelf.item = item
++                        let _ = titleApply()
++                        let _ = detailApply()
++
++                        let originX = floorToScreenPixels((boundingWidth - cardWidth) / 2.0)
++                        let frame = CGRect(origin: CGPoint(x: originX, y: 0.0), size: backgroundSize)
++
++                        if strongSelf.mediaBackgroundContent == nil, let backgroundContent = item.controllerInteraction.presentationContext.backgroundNode?.makeBubbleBackground(for: .free) {
++                            backgroundContent.clipsToBounds = true
++                            backgroundContent.cornerRadius = 24.0
++                            strongSelf.mediaBackgroundContent = backgroundContent
++                            strongSelf.insertSubnode(backgroundContent, at: 0)
++                        }
++                        if let backgroundContent = strongSelf.mediaBackgroundContent {
++                            animation.animator.updateFrame(layer: backgroundContent.layer, frame: frame, completion: nil)
++                            backgroundContent.cornerRadius = 24.0
++                        }
++
++                        let titleFrame = CGRect(
++                            origin: CGPoint(x: frame.minX + floorToScreenPixels((frame.width - titleLayout.size.width) / 2.0), y: frame.minY + 20.0),
++                            size: titleLayout.size
++                        )
++                        strongSelf.titleNode.frame = titleFrame
++                        strongSelf.detailNode.frame = CGRect(
++                            origin: CGPoint(x: frame.minX + floorToScreenPixels((frame.width - detailLayout.size.width) / 2.0), y: titleFrame.maxY + 8.0),
++                            size: detailLayout.size
++                        )
++                    })
++                })
++            })
++        }
++    }
++
++    override public func updateAbsoluteRect(_ rect: CGRect, within containerSize: CGSize) {
++        self.absoluteRect = (rect, containerSize)
++    }
++
++    override public func tapActionAtPoint(_ point: CGPoint, gesture: TapLongTapOrDoubleTapGesture, isEstimating: Bool) -> ChatMessageBubbleContentTapAction {
++        if self.mediaBackgroundContent?.frame.contains(point) == true {
++            return ChatMessageBubbleContentTapAction(content: .openMessage)
++        } else {
++            return ChatMessageBubbleContentTapAction(content: .none)
++        }
++    }
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD
+--- a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD	2026-10-23 15:21:59.561214315 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD	2026-10-23 15:21:59.601214286 +0000
+@@ -66,6 +66,7 @@
+         "//submodules/TelegramUI/Components/Gifts/InfoParagraphComponent",
+         "//submodules/TelegramUI/Components/Gifts/TableComponent",
+         "//submodules/TelegramUI/Components/Gifts/PeerTableCellComponent",
++        "//submodules/TelegramUI/Components/Gifts/GramPotScreen",
+         "//submodules/TelegramUI/Components/AlertComponent",
+         "//submodules/TelegramUI/Components/AvatarComponent",
+         "//submodules/TelegramUI/Components/AlertComponent/AlertTransferHeaderComponent",
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift
+--- a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift	2026-10-23 15:21:59.557214318 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift	2026-10-23 15:22:30.121192774 +0000
+@@ -43,6 +43,7 @@
+ import ChatMessagePaymentAlertController
+ import TableComponent
+ import PeerTableCellComponent
++import GramPotScreen
+ import AvatarComponent
+ import GlassControls
+ import GlassBarButtonComponent
+@@ -2129,6 +2130,48 @@
+             })
+             controller.present(tooltipController, in: .current)
+         }
++
++        func presentGramPot() {
++            guard let controller = self.getController() as? GiftViewScreen else {
++                return
++            }
++            guard let origin = controller.gramPotOrigin, let recipientId = origin.recipientId else {
++                return
++            }
++            guard case let .unique(gift) = self.subject.arguments?.gift else {
++                return
++            }
++            guard let ton = gift.resellAmounts?.first(where: { $0.currency == .ton && $0.amount.value > 0 }) else {
++                return
++            }
++            var model = ""
++            var backdrop = ""
++            var symbol = ""
++            for attribute in gift.attributes {
++                switch attribute {
++                case let .model(name, _, _, _):
++                    model = name
++                case let .backdrop(name, _, _, _, _, _, _):
++                    backdrop = name
++                case let .pattern(name, _, _):
++                    symbol = name
++                default:
++                    break
++                }
++            }
++            let screen = GramPotScreen(
++                context: self.context,
++                groupPeerId: origin.groupPeerId,
++                recipientId: recipientId,
++                priceNano: ton.amount.value,
++                slug: gift.slug,
++                giftTitle: gift.title,
++                model: model,
++                backdrop: backdrop,
++                symbol: symbol
++            )
++            controller.push(screen)
++        }
+         
+         func openMore() {
+             guard let controller = self.getController() as? GiftViewScreen else {
+@@ -2163,10 +2206,22 @@
+             
+             let link = "https://t.me/nft/\(gift.slug)"
+             
+-            let _ = (self.context.engine.data.get(
+-                TelegramEngine.EngineData.Item.Peer.Peer(id: arguments.peerId ?? context.account.peerId)
+-            )
+-            |> deliverOnMainQueue).start(next: { [weak self] peer in
++            let ownerId = arguments.peerId ?? context.account.peerId
++            let ownerSignal = self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: ownerId))
++            let gramPotSignal: Signal<Bool, NoError>
++            if let origin = controller.gramPotOrigin, origin.recipientId != self.context.account.peerId, case let .unique(uniqueGift) = arguments.gift {
++                let hasTonPrice = uniqueGift.resellAmounts?.contains(where: { $0.currency == .ton && $0.amount.value > 0 }) == true
++                let peerSignal = self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: origin.groupPeerId))
++                let countSignal = self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.ParticipantCount(id: origin.groupPeerId))
++                gramPotSignal = combineLatest(peerSignal, countSignal)
++                |> map { groupPeer, count in
++                    gramPotIsEligible(gramPotGroupFacts(peer: groupPeer, cachedParticipantCount: count, viewerIsRecipient: false, openedFromGroupMessage: true, hasTonPrice: hasTonPrice))
++                }
++            } else {
++                gramPotSignal = .single(false)
++            }
++            let _ = (combineLatest(ownerSignal, gramPotSignal)
++            |> deliverOnMainQueue).start(next: { [weak self] peer, showGramPot in
+                 guard let self, let controller = self.getController() as? GiftViewScreen else {
+                     return
+                 }
+@@ -2225,6 +2280,15 @@
+                     
+                     self?.shareGift()
+                 })))
++
++                if showGramPot {
++                    items.append(.action(ContextMenuActionItem(text: presentationData.strings.GramPot_Menu, badge: ContextMenuActionBadge(value: presentationData.strings.GramPot_Menu_New, color: .accent, style: .label), icon: { theme in
++                        return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Groups"), color: theme.contextMenu.primaryColor)
++                    }, action: { [weak self] c, _ in
++                        c?.dismiss(completion: nil)
++                        self?.presentGramPot()
++                    })))
++                }
+                 
+                 if let displayed = self.onchainProfileDisplayState(gift) {
+                     items.append(.action(ContextMenuActionItem(text: displayed ? strings.Gift_View_Context_HideFromProfile : strings.Gift_View_Context_ShowOnProfile, icon: { theme in
+@@ -4667,7 +4731,8 @@
+                                                             context: component.context,
+                                                             theme: theme,
+                                                             strings: strings,
+-                                                            peer: peer
++                                                            peer: peer,
++                                                            showsAvatar: false
+                                                         )
+                                                     ),
+                                                     action: { [weak state] in
+@@ -4700,7 +4765,8 @@
+                                                 context: component.context,
+                                                 theme: theme,
+                                                 strings: strings,
+-                                                peer: peer
++                                                peer: peer,
++                                                showsAvatar: false
+                                             )
+                                         ),
+                                         action: { [weak state] in
+@@ -5527,7 +5593,8 @@
+             if let controller = controller() as? GiftViewScreen, controller.openChatTheme != nil {
+                 isChatTheme = true
+             }
+-            if ((incoming && !converted && !upgraded) || exported || selling || isChatTheme) && (!showUpgradePreview && !showWearPreview && !isDismantled) {
++            let gramPotDelivery = (controller() as? GiftViewScreen)?.gramPotDelivery
++            if ((incoming && !converted && !upgraded) || exported || selling || isChatTheme || gramPotDelivery != nil) && (!showUpgradePreview && !showWearPreview && !isDismantled) {
+                 let textFont = Font.regular(13.0)
+                 let textColor = theme.list.itemSecondaryTextColor
+                 let linkColor = theme.actionSheet.controlAccentColor
+@@ -5542,7 +5609,10 @@
+                 var addressToOpen: String?
+                 var toggledSavedToProfile = !savedToProfile
+                 var descriptionText: String
+-                if isChatTheme {
++                if let gramPotDelivery {
++                    let shown = gramPotJoinedNames(gramPotNamesForViewer(gramPotDelivery.contributorNames, viewerName: gramPotDelivery.viewerName))
++                    descriptionText = strings.GramPot_GiftFromLine(shown).string
++                } else if isChatTheme {
+                     descriptionText = strings.Gift_View_OpenChatTheme
+                 } else if let uniqueGift, selling {
+                     let ownerName: String
+@@ -6026,6 +6096,18 @@
+                         action: { [weak state] in
+                             state?.updateSavedToProfile(!savedToProfile)
+                         })
++            } else if (controller() as? GiftViewScreen)?.gramPotDelivery != nil {
++                buttonComponent = ButtonComponent(
++                        background: buttonBackground,
++                        content: AnyComponentWithIdentity(
++                            id: AnyHashable("gramPotDone"),
++                            component: AnyComponent(MultilineTextComponent(text: .plain(NSAttributedString(string: strings.GramPot_Done, font: Font.semibold(17.0), textColor: theme.list.itemCheckColors.foregroundColor, paragraphAlignment: .center))))
++                        ),
++                        isEnabled: true,
++                        displaysProgress: false,
++                        action: { [weak state] in
++                            state?.dismiss(animated: true)
++                        })
+             } else if !incoming, let resellAmount, !isMyOwnedUniqueGift {
+                 if state.cachedStarImage == nil || state.cachedStarImage?.1 !== theme {
+                     state.cachedStarImage = (generateTintedImage(image: UIImage(bundleImageName: "Item List/PremiumIcon"), color: theme.list.itemCheckColors.foregroundColor)!, theme)
+@@ -6803,7 +6885,19 @@
+     }
+ }
+ 
+-public class GiftViewScreen: ViewControllerComponentContainer {
++public class GiftViewScreen: ViewControllerComponentContainer, GramPotGiftScreen {
++    public var gramPotOrigin: GramPotOrigin?
++    public var gramPotDelivery: GramPotDelivery?
++
++    public func gramPotSetOrigin(groupPeerId: EnginePeer.Id, messageId: EngineMessage.Id?, recipientId: EnginePeer.Id?) {
++        self.gramPotOrigin = GramPotOrigin(groupPeerId: groupPeerId, messageId: messageId, recipientId: recipientId)
++    }
++
++    public func gramPotSetDelivery(contributorNames: [String], viewerName: String) {
++        self.gramPotDelivery = GramPotDelivery(contributorNames: contributorNames, viewerName: viewerName)
++        self.view.setNeedsLayout()
++    }
++
+     public enum Subject: Equatable {
+         case message(EngineMessage)
+         case uniqueGift(StarGift.UniqueGift, EnginePeer.Id?)
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/BUILD b/submodules/TelegramUI/Components/Gifts/GramPotScreen/BUILD
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/BUILD	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/BUILD	2026-10-23 15:21:59.609214280 +0000
+@@ -0,0 +1,32 @@
++load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
++
++swift_library(
++    name = "GramPotScreen",
++    module_name = "GramPotScreen",
++    srcs = glob([
++        "Sources/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++        "//submodules/AsyncDisplayKit",
++        "//submodules/Display",
++        "//submodules/TelegramCore",
++        "//submodules/Postbox",
++        "//submodules/SSignalKit/SwiftSignalKit",
++        "//submodules/TelegramPresentationData",
++        "//submodules/AccountContext",
++        "//submodules/ComponentFlow",
++        "//submodules/Components/ComponentDisplayAdapters",
++        "//submodules/Components/ViewControllerComponent",
++        "//submodules/Components/MultilineTextComponent",
++        "//submodules/TelegramUI/Components/ButtonComponent",
++        "//submodules/TelegramUI/Components/Wallet/WalletSendKeyboardComponent",
++        "//submodules/TelegramStringFormatting",
++        "//submodules/TemporaryCachedPeerDataManager",
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Amounts.swift b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Amounts.swift
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Amounts.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Amounts.swift	2026-10-23 15:21:59.621214271 +0000
+@@ -0,0 +1,181 @@
++import Foundation
++
++/// 1 GRAM is 1_000_000_000 nano, the same unit `StarsAmount.value` uses for TON.
++public let gramPotNanoPerGram: Int64 = 1_000_000_000
++
++/// 1 USD is 1_000_000 micro-USD. Stored as an integer so the locked rate does not drift.
++public let gramPotMicroUsdPerUsd: Int64 = 1_000_000
++
++/// 1 cent is 10_000 micro-USD.
++public let gramPotMicroUsdPerCent: Int64 = 10_000
++
++/// Equal spots in nano-GRAM. The first `price % count` spots receive one extra nano,
++/// so the spots differ by at most 1 nano and sum to `priceNano`.
++/// Every spot is at least 1 nano. Returns nil when the price or the count cannot be split that way.
++public func gramPotEqualSpotAmounts(priceNano: Int64, spotCount: Int) -> [Int64]? {
++    guard priceNano > 0, spotCount > 0 else {
++        return nil
++    }
++    let count = Int64(spotCount)
++    guard priceNano >= count else {
++        return nil
++    }
++    let base = priceNano / count
++    let remainder = priceNano % count
++    var amounts: [Int64] = []
++    amounts.reserveCapacity(spotCount)
++    for index in 0 ..< spotCount {
++        let extra: Int64 = Int64(index) < remainder ? 1 : 0
++        amounts.append(base + extra)
++    }
++    return amounts
++}
++
++/// Fiat cents for a nano-GRAM amount at a locked micro-USD-per-GRAM rate.
++/// Half-up, and nil if the value is negative or the result does not fit in `Int64`.
++public func gramPotUsdCents(nanoGram: Int64, microUsdPerGram: Int64) -> Int64? {
++    guard nanoGram >= 0, microUsdPerGram >= 0 else {
++        return nil
++    }
++    // cents = round_half_up(nano * microUsdPerGram / (nanoPerGram * microUsdPerCent))
++    let divisor = UInt64(gramPotNanoPerGram) * UInt64(gramPotMicroUsdPerCent)
++    guard let cents = multiplyThenDivideRoundingHalfUp(
++        UInt64(nanoGram),
++        UInt64(microUsdPerGram),
++        divisor
++    ) else {
++        return nil
++    }
++    guard cents <= UInt64(Int64.max) else {
++        return nil
++    }
++    return Int64(cents)
++}
++
++/// "4,000" or "800.000000001". Nil for a negative amount.
++public func gramPotGramText(nano: Int64) -> String? {
++    guard nano >= 0 else {
++        return nil
++    }
++    let whole = nano / gramPotNanoPerGram
++    let fraction = nano % gramPotNanoPerGram
++    guard let wholeText = groupedDecimal(whole) else {
++        return nil
++    }
++    if fraction == 0 {
++        return wholeText
++    }
++    var digits = String(fraction)
++    if digits.count < 9 {
++        digits = String(repeating: "0", count: 9 - digits.count) + digits
++    }
++    while digits.last == "0" {
++        digits.removeLast()
++    }
++    return wholeText + "." + digits
++}
++
++/// "$1,050.40". Nil for a negative number of cents.
++public func gramPotUsdText(cents: Int64) -> String? {
++    guard cents >= 0 else {
++        return nil
++    }
++    let dollars = cents / 100
++    let remainder = cents % 100
++    guard let dollarText = groupedDecimal(dollars) else {
++        return nil
++    }
++    let remText = remainder < 10 ? "0\(remainder)" : "\(remainder)"
++    return "$" + dollarText + "." + remText
++}
++
++func groupedDecimal(_ value: Int64) -> String? {
++    guard value >= 0 else {
++        return nil
++    }
++    if value == 0 {
++        return "0"
++    }
++    var rest = value
++    var digits: [Character] = []
++    var group = 0
++    while rest > 0 {
++        if group == 3 {
++            digits.append(",")
++            group = 0
++        }
++        let digit = rest % 10
++        digits.append(contentsOf: String(digit))
++        rest /= 10
++        group += 1
++    }
++    return String(digits.reversed())
++}
++
++/// (a * b) / divisor, half away from zero on a tie. Nil if the quotient does not fit in 64 bits.
++func multiplyThenDivideRoundingHalfUp(_ a: UInt64, _ b: UInt64, _ divisor: UInt64) -> UInt64? {
++    guard divisor > 0 else {
++        return nil
++    }
++    let (hi, lo) = multiplyWide(a, b)
++    guard let divided = divideWide(hi: hi, lo: lo, by: divisor) else {
++        return nil
++    }
++    var quotient = divided.quotient
++    let remainder = divided.remainder
++    let threshold = (divisor - 1) / 2
++    if remainder > threshold {
++        guard quotient < UInt64.max else {
++            return nil
++        }
++        quotient += 1
++    }
++    return quotient
++}
++
++func multiplyWide(_ a: UInt64, _ b: UInt64) -> (hi: UInt64, lo: UInt64) {
++    let a0 = a & 0xFFFF_FFFF
++    let a1 = a >> 32
++    let b0 = b & 0xFFFF_FFFF
++    let b1 = b >> 32
++    let p00 = a0 * b0
++    let p01 = a0 * b1
++    let p10 = a1 * b0
++    let p11 = a1 * b1
++    let mid = (p00 >> 32) + (p01 & 0xFFFF_FFFF) + (p10 & 0xFFFF_FFFF)
++    let lo = (p00 & 0xFFFF_FFFF) | ((mid & 0xFFFF_FFFF) << 32)
++    let hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)
++    return (hi, lo)
++}
++
++func divideWide(hi: UInt64, lo: UInt64, by divisor: UInt64) -> (quotient: UInt64, remainder: UInt64)? {
++    if divisor == 0 {
++        return nil
++    }
++    if hi == 0 {
++        return (lo / divisor, lo % divisor)
++    }
++    if hi >= divisor {
++        return nil
++    }
++    var remainder: UInt64 = 0
++    var quotient: UInt64 = 0
++    for index in stride(from: 127, through: 0, by: -1) {
++        let bit: UInt64
++        if index >= 64 {
++            bit = (hi >> UInt64(index - 64)) & 1
++        } else {
++            bit = (lo >> UInt64(index)) & 1
++        }
++        let carried = remainder > (UInt64.max >> 1)
++        remainder = (remainder << 1) | bit
++        if carried || remainder >= divisor {
++            remainder &-= divisor
++            if index >= 64 {
++                return nil
++            }
++            quotient |= 1 << UInt64(index)
++        }
++    }
++    return (quotient, remainder)
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Copy.swift b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Copy.swift
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Copy.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Copy.swift	2026-10-23 15:21:59.613214277 +0000
+@@ -0,0 +1,50 @@
++import Foundation
++
++/// Joins names the way the gift footer does: "A", "A and B", "A, B, C and D". No comma before the last name.
++public func gramPotJoinedNames(_ names: [String]) -> String {
++    switch names.count {
++    case 0:
++        return ""
++    case 1:
++        return names[0]
++    case 2:
++        return names[0] + " and " + names[1]
++    default:
++        let head = names.dropLast().joined(separator: ", ")
++        return head + " and " + names[names.count - 1]
++    }
++}
++
++/// Replaces the viewer's own name with "You" where it already stands. Does not move it.
++public func gramPotNamesForViewer(_ names: [String], viewerName: String) -> [String] {
++    names.map { name in
++        name == viewerName ? "You" : name
++    }
++}
++
++public func gramPotGiftFromFooter(names: [String], viewerName: String) -> String {
++    let shown = gramPotJoinedNames(gramPotNamesForViewer(names, viewerName: viewerName))
++    return "A gift from " + shown + " via Gram Pot."
++}
++
++public func gramPotSentYouText(names: [String], viewerName: String) -> String {
++    let shown = gramPotJoinedNames(gramPotNamesForViewer(names, viewerName: viewerName))
++    return shown + " sent you a gift via Gram Pot"
++}
++
++public func gramPotStartedText(actor: String, recipient: String) -> String {
++    actor + " started a Gram Pot for " + recipient
++}
++
++/// The amount is the GRAM figure ("800"). The chat draws the GRAM mark beside it.
++public func gramPotChippedInText(actor: String, amount: String) -> String {
++    actor + " chipped in " + amount
++}
++
++public func gramPotCompleteText(recipient: String) -> String {
++    "Gram Pot complete · " + recipient + " received the gift"
++}
++
++public func gramPotProgressText(contributed: String, price: String) -> String {
++    contributed + " of " + price
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Eligibility.swift b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Eligibility.swift
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Eligibility.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/Eligibility.swift	2026-10-23 15:21:59.629214266 +0000
+@@ -0,0 +1,53 @@
++import Foundation
++
++/// Facts the gift sheet already knows when it decides whether to show Gram Pot.
++public struct GramPotGroupFacts: Equatable, Sendable {
++    /// Legacy group, or a supergroup. A broadcast channel is not a group.
++    public var isGroup: Bool
++    /// True when the group has a public username. Private groups have none.
++    public var hasPublicUsername: Bool
++    /// Nil when the count is not loaded yet. An unknown count stays hidden.
++    public var memberCount: Int?
++    /// The collectible was opened from a message in this group, not from a profile or a link alone.
++    public var openedFromGroupMessage: Bool
++    /// The viewer is the person the pot would be for.
++    public var viewerIsRecipient: Bool
++    /// The collectible has a GRAM (TON) resale price.
++    public var hasTonPrice: Bool
++
++    public init(
++        isGroup: Bool,
++        hasPublicUsername: Bool,
++        memberCount: Int?,
++        openedFromGroupMessage: Bool,
++        viewerIsRecipient: Bool,
++        hasTonPrice: Bool
++    ) {
++        self.isGroup = isGroup
++        self.hasPublicUsername = hasPublicUsername
++        self.memberCount = memberCount
++        self.openedFromGroupMessage = openedFromGroupMessage
++        self.viewerIsRecipient = viewerIsRecipient
++        self.hasTonPrice = hasTonPrice
++    }
++}
++
++/// Gram Pot is offered only for a collectible sent in a private group of 2–8 members,
++/// with a GRAM price, to someone other than the viewer.
++public func gramPotIsEligible(_ facts: GramPotGroupFacts) -> Bool {
++    guard facts.isGroup, !facts.hasPublicUsername, facts.openedFromGroupMessage, !facts.viewerIsRecipient, facts.hasTonPrice else {
++        return false
++    }
++    guard let memberCount = facts.memberCount, (2 ... 8).contains(memberCount) else {
++        return false
++    }
++    return true
++}
++
++/// Spots are the members other than the recipient. Nil when the group is too small to have one.
++public func gramPotSpotCount(memberCount: Int) -> Int? {
++    guard memberCount >= 2 else {
++        return nil
++    }
++    return memberCount - 1
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotBridge.swift b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotBridge.swift
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotBridge.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotBridge.swift	2026-10-23 15:21:59.617214274 +0000
+@@ -0,0 +1,67 @@
++import Foundation
++import TelegramCore
++
++/// Maps a Telegram peer onto the facts `gramPotIsEligible` understands.
++/// A legacy group has no public username. A supergroup counts only when its info is `.group` and it has no username.
++/// An unknown channel member count stays ineligible.
++public func gramPotGroupFacts(
++    peer: EnginePeer?,
++    cachedParticipantCount: Int?,
++    viewerIsRecipient: Bool,
++    openedFromGroupMessage: Bool,
++    hasTonPrice: Bool
++) -> GramPotGroupFacts {
++    switch peer {
++    case let .legacyGroup(group):
++        return GramPotGroupFacts(
++            isGroup: true,
++            hasPublicUsername: false,
++            memberCount: cachedParticipantCount ?? group.participantCount,
++            openedFromGroupMessage: openedFromGroupMessage,
++            viewerIsRecipient: viewerIsRecipient,
++            hasTonPrice: hasTonPrice
++        )
++    case let .channel(channel):
++        let isGroup: Bool
++        if case .group = channel.info {
++            isGroup = true
++        } else {
++            isGroup = false
++        }
++        let hasPublicUsername = channel.username != nil || !channel.usernames.isEmpty
++        return GramPotGroupFacts(
++            isGroup: isGroup,
++            hasPublicUsername: hasPublicUsername,
++            memberCount: cachedParticipantCount,
++            openedFromGroupMessage: openedFromGroupMessage,
++            viewerIsRecipient: viewerIsRecipient,
++            hasTonPrice: hasTonPrice
++        )
++    default:
++        return GramPotGroupFacts(
++            isGroup: false,
++            hasPublicUsername: false,
++            memberCount: nil,
++            openedFromGroupMessage: openedFromGroupMessage,
++            viewerIsRecipient: viewerIsRecipient,
++            hasTonPrice: hasTonPrice
++        )
++    }
++}
++
++public func gramPotMemberId(_ peerId: EnginePeer.Id) -> GramPotMemberID {
++    GramPotMemberID(rawValue: peerId.toInt64())
++}
++
++/// One-time conversion of a USD-per-GRAM quote into the integer the pot locks.
++/// `payments.currencyRates` reports a `Double`. After this, the pot does not read the `Double` again.
++public func gramPotMicroUsdPerGram(usdPerGram: Double) -> Int64? {
++    guard usdPerGram.isFinite, usdPerGram >= 0 else {
++        return nil
++    }
++    let micro = (usdPerGram * Double(gramPotMicroUsdPerUsd)).rounded()
++    guard micro <= Double(Int64.max) else {
++        return nil
++    }
++    return Int64(micro)
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotMessages.swift b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotMessages.swift
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotMessages.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotMessages.swift	2026-10-23 15:21:59.609214280 +0000
+@@ -0,0 +1,58 @@
++import Foundation
++import Postbox
++import TelegramCore
++import SwiftSignalKit
++
++/// Posts a service line with `TelegramMediaAction.customText`, so no new media-action case is required.
++func gramPotEnqueueServiceText(context: AccountContext, groupPeerId: EnginePeer.Id, text: String) {
++    let _ = enqueueMessages(
++        account: context.account,
++        peerId: groupPeerId,
++        messages: [
++            .message(
++                text: "",
++                attributes: [],
++                inlineStickers: [:],
++                mediaReference: .standalone(media: TelegramMediaAction(action: .customText(text: text, entities: [], additionalAttributes: nil))),
++                threadId: nil,
++                replyToMessageId: nil,
++                replyToStoryId: nil,
++                localGroupingKey: nil,
++                correlationId: nil,
++                bubbleUpEmojiOrStickersets: []
++            )
++        ]
++    ).startStandalone()
++}
++
++/// Posts the pot card or the local preview of the gift card. The official-account delivery is server-authored.
++func gramPotEnqueueCard(context: AccountContext, groupPeerId: EnginePeer.Id, attribute: GramPotMessageAttribute) {
++    let _ = enqueueMessages(
++        account: context.account,
++        peerId: groupPeerId,
++        messages: [
++            .message(
++                text: "",
++                attributes: [attribute],
++                inlineStickers: [:],
++                mediaReference: nil,
++                threadId: nil,
++                replyToMessageId: nil,
++                replyToStoryId: nil,
++                localGroupingKey: nil,
++                correlationId: nil,
++                bubbleUpEmojiOrStickersets: []
++            )
++        ]
++    ).startStandalone()
++}
++
++/// Applies only this device's wallet delta. Other members' debits and credits happen on their own clients.
++/// `.spendEscrow` is not a wallet movement.
++func gramPotApplyLocalWallet(context: AccountContext, effects: [GramPotWalletEffect], localMemberId: GramPotMemberID) {
++    let delta = GramPot.localWalletDelta(effects: effects, localMemberId: localMemberId)
++    guard delta != 0, let tonContext = context.tonContext, tonContext.ton else {
++        return
++    }
++    tonContext.add(balance: StarsAmount(value: delta, nanos: 0))
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotScreen.swift b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotScreen.swift
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotScreen.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPotScreen.swift	2026-10-23 15:21:59.621214271 +0000
+@@ -0,0 +1,523 @@
++import Foundation
++import UIKit
++import Display
++import ComponentFlow
++import ViewControllerComponent
++import MultilineTextComponent
++import ButtonComponent
++import SwiftSignalKit
++import Postbox
++import TelegramCore
++import TelegramPresentationData
++import AccountContext
++import WalletSendKeyboardComponent
++import TemporaryCachedPeerDataManager
++
++public struct GramPotOrigin: Equatable {
++    public let groupPeerId: EnginePeer.Id
++    public let messageId: EngineMessage.Id?
++    public let recipientId: EnginePeer.Id?
++
++    public init(groupPeerId: EnginePeer.Id, messageId: EngineMessage.Id?, recipientId: EnginePeer.Id?) {
++        self.groupPeerId = groupPeerId
++        self.messageId = messageId
++        self.recipientId = recipientId
++    }
++}
++
++public struct GramPotDelivery: Equatable {
++    public let contributorNames: [String]
++    public let viewerName: String
++
++    public init(contributorNames: [String], viewerName: String) {
++        self.contributorNames = contributorNames
++        self.viewerName = viewerName
++    }
++}
++
++/// Chip-in screen. One tap debits the viewer's GRAM wallet into escrow.
++/// The keypad is the wallet keypad. It is on screen and does not change the locked spot.
++public final class GramPotScreen: ViewControllerComponentContainer {
++    private let context: AccountContext
++    private let groupPeerId: EnginePeer.Id
++    private let recipientId: EnginePeer.Id
++    private let priceNano: Int64
++    private let slug: String
++    private let giftTitle: String
++    private let model: String
++    private let backdrop: String
++    private let symbol: String
++
++    private var pot: GramPot?
++    private var names: [GramPotMemberID: String] = [:]
++    private var viewerName: String = ""
++    private var microUsdPerGram: Int64 = 0
++    private var balanceNano: Int64 = 0
++    private var statusText: String = ""
++    private var disposable: Disposable?
++    private var memberListDisposable: Disposable?
++
++    public init(
++        context: AccountContext,
++        groupPeerId: EnginePeer.Id,
++        recipientId: EnginePeer.Id,
++        priceNano: Int64,
++        slug: String,
++        giftTitle: String,
++        model: String,
++        backdrop: String,
++        symbol: String
++    ) {
++        self.context = context
++        self.groupPeerId = groupPeerId
++        self.recipientId = recipientId
++        self.priceNano = priceNano
++        self.slug = slug
++        self.giftTitle = giftTitle
++        self.model = model
++        self.backdrop = backdrop
++        self.symbol = symbol
++
++        super.init(
++            context: context,
++            component: GramPotScreenComponent(
++                title: "",
++                amountText: "",
++                fiatText: "",
++                progressText: "",
++                noteText: "",
++                balanceText: "",
++                buttonTitle: "",
++                buttonEnabled: false,
++                theme: context.sharedContext.currentPresentationData.with { $0 }.theme,
++                strings: context.sharedContext.currentPresentationData.with { $0 }.strings,
++                dateTimeFormat: context.sharedContext.currentPresentationData.with { $0 }.dateTimeFormat,
++                chipIn: {},
++                dismiss: {}
++            ),
++            navigationBarAppearance: .default
++        )
++
++        self.title = "Gram Pot"
++        self.navigationPresentation = .modal
++        self.load()
++    }
++
++    required public init(coder aDecoder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    deinit {
++        self.disposable?.dispose()
++        self.memberListDisposable?.dispose()
++    }
++
++    private func load() {
++        let peerSignal = self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: self.groupPeerId))
++        let cachedSignal = self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.CachedData(id: self.groupPeerId))
++        let recipientSignal = self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: self.recipientId))
++        let viewerSignal = self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: self.context.account.peerId))
++        let ratesSignal = self.context.engine.payments.currencyRates()
++
++        self.disposable = (combineLatest(peerSignal, cachedSignal, recipientSignal, viewerSignal, ratesSignal)
++        |> deliverOnMainQueue).start(next: { [weak self] peer, cached, recipient, viewer, rates in
++            guard let self else {
++                return
++            }
++            if let viewer {
++                self.viewerName = viewer.compactDisplayTitle
++            }
++            if let recipient {
++                self.names[gramPotMemberId(recipient.id)] = recipient.compactDisplayTitle
++            }
++            if let usd = rates?.first(where: { $0.currency == "USD" }) {
++                self.microUsdPerGram = gramPotMicroUsdPerGram(usdPerGram: usd.rate) ?? 0
++            }
++            self.readBalance()
++
++            if case .legacyGroup = peer, let cachedGroup = cached as? CachedGroupData {
++                let ids = cachedGroup.participants?.participants.map { $0.peerId } ?? []
++                self.startIfPossible(memberPeerIds: ids)
++            } else if case .channel = peer {
++                self.memberListDisposable?.dispose()
++                self.memberListDisposable = self.context.peerChannelMemberCategoriesContextsManager.recent(
++                    engine: self.context.engine,
++                    accountPeerId: self.context.account.peerId,
++                    peerId: self.groupPeerId,
++                    count: Int32(8),
++                    updated: { [weak self] state in
++                        Queue.mainQueue().async {
++                            self?.startIfPossible(memberPeerIds: state.list.map { $0.peer.id })
++                        }
++                    }
++                ).0
++            }
++        })
++    }
++
++    private func readBalance() {
++        if let tonContext = self.context.tonContext, tonContext.ton, let state = tonContext.currentState {
++            self.balanceNano = state.balance.value
++        }
++    }
++
++    private func startIfPossible(memberPeerIds: [EnginePeer.Id]) {
++        guard self.pot == nil else {
++            self.reload()
++            return
++        }
++        var memberIds: [GramPotMemberID] = []
++        var seen = Set<GramPotMemberID>()
++        for peerId in memberPeerIds {
++            let memberId = gramPotMemberId(peerId)
++            if seen.insert(memberId).inserted {
++                memberIds.append(memberId)
++            }
++        }
++        let recipientMember = gramPotMemberId(self.recipientId)
++        if !memberIds.contains(recipientMember) {
++            memberIds.append(recipientMember)
++        }
++        let createdAt = Int64(Date().timeIntervalSince1970)
++        switch GramPot.start(
++            id: createdAt,
++            priceNano: self.priceNano,
++            microUsdPerGram: self.microUsdPerGram,
++            recipientId: recipientMember,
++            memberIds: memberIds,
++            createdAt: createdAt
++        ) {
++        case let .success(pot):
++            self.pot = pot
++            self.loadNames(memberPeerIds)
++            self.reload()
++        case .failure:
++            self.statusText = self.currentStrings.GramPot_Unavailable
++            self.reload()
++        }
++    }
++
++    private var currentStrings: PresentationStrings {
++        self.context.sharedContext.currentPresentationData.with { $0 }.strings
++    }
++
++    private func loadNames(_ peerIds: [EnginePeer.Id]) {
++        for peerId in peerIds {
++            let _ = (self.context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: peerId))
++            |> deliverOnMainQueue).start(next: { [weak self] peer in
++                guard let self, let peer else {
++                    return
++                }
++                self.names[gramPotMemberId(peer.id)] = peer.compactDisplayTitle
++                self.reload()
++            })
++        }
++    }
++
++    private func chipIn() {
++        guard var pot = self.pot else {
++            return
++        }
++        self.readBalance()
++        let localId = gramPotMemberId(self.context.account.peerId)
++        guard let spot = pot.spotAmounts[localId] else {
++            return
++        }
++        let now = Int64(Date().timeIntervalSince1970)
++        let wasOpen = pot.phase == .open
++        let transition = pot.chipIn(memberId: localId, nano: spot, balanceNano: self.balanceNano, now: now)
++        gramPotApplyLocalWallet(context: self.context, effects: transition.effects, localMemberId: localId)
++        self.pot = pot
++        self.readBalance()
++
++        let strings = self.currentStrings
++        let actor = "You"
++        let recipientName = self.names[pot.recipientId] ?? ""
++        if wasOpen, transition.succeeded {
++            gramPotEnqueueServiceText(
++                context: self.context,
++                groupPeerId: self.groupPeerId,
++                text: strings.GramPot_Started(actor, recipientName).string
++            )
++        }
++        if transition.succeeded {
++            let amount = gramPotGramText(nano: spot) ?? ""
++            gramPotEnqueueServiceText(
++                context: self.context,
++                groupPeerId: self.groupPeerId,
++                text: strings.GramPot_ChippedIn(actor, amount).string
++            )
++            self.postCard(pot: pot, kind: .pot)
++        }
++        if pot.phase == .complete, transition.succeeded {
++            gramPotEnqueueServiceText(
++                context: self.context,
++                groupPeerId: self.groupPeerId,
++                text: strings.GramPot_Complete(recipientName).string
++            )
++            self.postCard(pot: pot, kind: .deliveredGift)
++            let contributors = pot.spotOrder.compactMap { self.names[$0] }
++            if let navigationController = self.navigationController {
++                for controller in navigationController.viewControllers {
++                    if let gift = controller as? GramPotGiftScreen {
++                        gift.gramPotSetDelivery(contributorNames: contributors, viewerName: self.viewerName)
++                    }
++                }
++            }
++            let _ = self.context.engine.payments.finishGramPot(potId: pot.id, slug: self.slug, recipientId: self.recipientId).start(error: { _ in
++            })
++        }
++        if transition.error == .insufficientBalance {
++            self.statusText = strings.GramPot_NotEnough
++        } else if transition.error == .expired {
++            self.statusText = strings.GramPot_Held
++        }
++        self.reload()
++    }
++
++    private func postCard(pot: GramPot, kind: GramPotMessageAttribute.Kind) {
++        let names = pot.contributions.compactMap { self.names[$0.memberId] }
++        let attribute = GramPotMessageAttribute(
++            potId: pot.id,
++            kind: kind,
++            priceNano: pot.priceNano,
++            contributedNano: pot.contributedNano,
++            recipientName: self.names[pot.recipientId] ?? "",
++            contributorNames: names,
++            giftTitle: self.giftTitle,
++            model: self.model,
++            backdrop: self.backdrop,
++            symbol: self.symbol
++        )
++        gramPotEnqueueCard(context: self.context, groupPeerId: self.groupPeerId, attribute: attribute)
++    }
++
++    private func reload() {
++        let strings = self.currentStrings
++        let presentation = self.context.sharedContext.currentPresentationData.with { $0 }
++        let recipientName = self.pot.flatMap { self.names[$0.recipientId] } ?? ""
++        let localId = gramPotMemberId(self.context.account.peerId)
++        let spot = self.pot?.spotAmounts[localId]
++        let contributed = self.pot?.contributedNano ?? 0
++        let price = self.pot?.priceNano ?? self.priceNano
++        let contributedText = gramPotGramText(nano: contributed) ?? "0"
++        let priceText = gramPotGramText(nano: price) ?? ""
++        let spotText = gramPotGramText(nano: spot ?? 0) ?? ""
++        let amountText = spotText.isEmpty ? priceText : spotText
++        var fiatText = ""
++        if let spot, let cents = gramPotUsdCents(nanoGram: spot, microUsdPerGram: self.microUsdPerGram), let text = gramPotUsdText(cents: cents) {
++            fiatText = text
++        }
++        let progress = gramPotProgressText(contributed: contributedText, price: priceText)
++        var note = strings.GramPot_Held
++        if self.pot?.phase == .open {
++            note = strings.GramPot_YoureFirst + "\n" + note
++        }
++        if !self.statusText.isEmpty {
++            note = self.statusText
++        }
++        let spots = self.pot?.spotOrder.count ?? 0
++        let split = spots > 0 ? strings.GramPot_SplitWays("\(spots)").string : ""
++        let balanceText = strings.GramPot_Balance(gramPotGramText(nano: self.balanceNano) ?? "0").string
++        let canChip = self.pot?.phase == .open || self.pot?.phase == .filling
++        let already = self.pot?.contributions.contains(where: { $0.memberId == localId }) == true
++        let buttonTitle = strings.GramPot_ChipIn(amountText).string
++
++        self.updateComponent(
++            component: AnyComponent(GramPotScreenComponent(
++                title: strings.GramPot_Title(recipientName).string,
++                amountText: amountText,
++                fiatText: fiatText,
++                progressText: progress + (split.isEmpty ? "" : "\n" + split),
++                noteText: note,
++                balanceText: balanceText,
++                buttonTitle: buttonTitle,
++                buttonEnabled: canChip && !already && spot != nil,
++                theme: presentation.theme,
++                strings: strings,
++                dateTimeFormat: presentation.dateTimeFormat,
++                chipIn: { [weak self] in
++                    self?.chipIn()
++                },
++                dismiss: { [weak self] in
++                    self?.dismiss()
++                }
++            )),
++            transition: .immediate
++        )
++    }
++}
++
++private final class GramPotScreenComponent: Component {
++    typealias EnvironmentType = ViewControllerComponentContainer.Environment
++
++    let title: String
++    let amountText: String
++    let fiatText: String
++    let progressText: String
++    let noteText: String
++    let balanceText: String
++    let buttonTitle: String
++    let buttonEnabled: Bool
++    let theme: PresentationTheme
++    let strings: PresentationStrings
++    let dateTimeFormat: PresentationDateTimeFormat
++    let chipIn: () -> Void
++    let dismiss: () -> Void
++
++    init(
++        title: String,
++        amountText: String,
++        fiatText: String,
++        progressText: String,
++        noteText: String,
++        balanceText: String,
++        buttonTitle: String,
++        buttonEnabled: Bool,
++        theme: PresentationTheme,
++        strings: PresentationStrings,
++        dateTimeFormat: PresentationDateTimeFormat,
++        chipIn: @escaping () -> Void,
++        dismiss: @escaping () -> Void
++    ) {
++        self.title = title
++        self.amountText = amountText
++        self.fiatText = fiatText
++        self.progressText = progressText
++        self.noteText = noteText
++        self.balanceText = balanceText
++        self.buttonTitle = buttonTitle
++        self.buttonEnabled = buttonEnabled
++        self.theme = theme
++        self.strings = strings
++        self.dateTimeFormat = dateTimeFormat
++        self.chipIn = chipIn
++        self.dismiss = dismiss
++    }
++
++    static func ==(lhs: GramPotScreenComponent, rhs: GramPotScreenComponent) -> Bool {
++        return lhs.title == rhs.title
++            && lhs.amountText == rhs.amountText
++            && lhs.fiatText == rhs.fiatText
++            && lhs.progressText == rhs.progressText
++            && lhs.noteText == rhs.noteText
++            && lhs.balanceText == rhs.balanceText
++            && lhs.buttonTitle == rhs.buttonTitle
++            && lhs.buttonEnabled == rhs.buttonEnabled
++            && lhs.theme === rhs.theme
++            && lhs.strings === rhs.strings
++    }
++
++    final class View: UIView {
++        private let title = ComponentView<Empty>()
++        private let amount = ComponentView<Empty>()
++        private let fiat = ComponentView<Empty>()
++        private let progress = ComponentView<Empty>()
++        private let note = ComponentView<Empty>()
++        private let balance = ComponentView<Empty>()
++        private let button = ComponentView<Empty>()
++        private let keyboard = ComponentView<Empty>()
++
++        func update(component: GramPotScreenComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
++            let env = environment[EnvironmentType.self].value
++            let side = max(env.safeInsets.left, env.safeInsets.right) + 16.0
++            let width = availableSize.width - side * 2.0
++            var y = env.navigationHeight + 12.0
++
++            func place(_ view: ComponentView<Empty>, text: String, font: UIFont, color: UIColor, heightLimit: CGFloat) -> CGFloat {
++                guard !text.isEmpty else {
++                    return 0.0
++                }
++                let size = view.update(
++                    transition: .immediate,
++                    component: AnyComponent(MultilineTextComponent(
++                        text: .plain(NSAttributedString(string: text, font: font, textColor: color, paragraphAlignment: .center))
++                    )),
++                    environment: {},
++                    containerSize: CGSize(width: width, height: heightLimit)
++                )
++                if let child = view.view {
++                    if child.superview == nil {
++                        self.addSubview(child)
++                    }
++                    child.frame = CGRect(x: side + floor((width - size.width) / 2.0), y: y, width: size.width, height: size.height)
++                }
++                return size.height
++            }
++
++            y += place(self.title, text: component.title, font: Font.semibold(20.0), color: component.theme.list.itemPrimaryTextColor, heightLimit: 60.0)
++            y += 18.0
++            y += place(self.amount, text: component.amountText + " GRAM", font: Font.semibold(36.0), color: component.theme.list.itemPrimaryTextColor, heightLimit: 50.0)
++            y += 4.0
++            y += place(self.fiat, text: component.fiatText, font: Font.regular(15.0), color: component.theme.list.itemSecondaryTextColor, heightLimit: 24.0)
++            y += 12.0
++            y += place(self.progress, text: component.progressText, font: Font.regular(15.0), color: component.theme.list.itemPrimaryTextColor, heightLimit: 80.0)
++            y += 8.0
++            y += place(self.note, text: component.noteText, font: Font.regular(13.0), color: component.theme.list.itemSecondaryTextColor, heightLimit: 80.0)
++            y += 8.0
++            y += place(self.balance, text: component.balanceText, font: Font.regular(13.0), color: component.theme.list.itemSecondaryTextColor, heightLimit: 24.0)
++
++            let buttonSize = self.button.update(
++                transition: .immediate,
++                component: AnyComponent(ButtonComponent(
++                    background: ButtonComponent.Background(
++                        style: .glass,
++                        color: component.theme.list.itemCheckColors.fillColor,
++                        foreground: component.theme.list.itemCheckColors.foregroundColor,
++                        pressedColor: component.theme.list.itemCheckColors.fillColor.withMultipliedAlpha(0.8),
++                        cornerRadius: 26.0
++                    ),
++                    content: AnyComponentWithIdentity(
++                        id: AnyHashable("chip"),
++                        component: AnyComponent(MultilineTextComponent(
++                            text: .plain(NSAttributedString(string: component.buttonTitle, font: Font.semibold(17.0), textColor: component.theme.list.itemCheckColors.foregroundColor, paragraphAlignment: .center))
++                        ))
++                    ),
++                    isEnabled: component.buttonEnabled,
++                    action: component.chipIn
++                )),
++                environment: {},
++                containerSize: CGSize(width: width, height: 52.0)
++            )
++            if let buttonView = self.button.view {
++                if buttonView.superview == nil {
++                    self.addSubview(buttonView)
++                }
++                buttonView.frame = CGRect(x: side, y: y + 16.0, width: width, height: buttonSize.height)
++            }
++
++            let keyboardHeight: CGFloat = 260.0
++            let _ = self.keyboard.update(
++                transition: .immediate,
++                component: AnyComponent(WalletSendKeyboardComponent(
++                    theme: component.theme,
++                    safeInsets: env.safeInsets,
++                    isLandscape: env.orientation?.isLandscape == true,
++                    mode: .decimal(separator: component.dateTimeFormat.decimalSeparator),
++                    deleteTitle: component.strings.Common_Delete,
++                    isEnabled: true,
++                    action: { _ in
++                        // The listing price and the spot are locked. Key presses do not retarget the pot.
++                    }
++                )),
++                environment: {},
++                containerSize: CGSize(width: availableSize.width, height: keyboardHeight)
++            )
++            if let keyboardView = self.keyboard.view {
++                if keyboardView.superview == nil {
++                    self.addSubview(keyboardView)
++                }
++                keyboardView.frame = CGRect(x: 0.0, y: availableSize.height - keyboardHeight - env.safeInsets.bottom, width: availableSize.width, height: keyboardHeight)
++            }
++            return availableSize
++        }
++    }
++
++    func makeView() -> View {
++        View(frame: CGRect())
++    }
++
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
++        view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPot.swift b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPot.swift
+--- a/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPot.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/submodules/TelegramUI/Components/Gifts/GramPotScreen/Sources/GramPot.swift	2026-10-23 15:21:59.625214269 +0000
+@@ -0,0 +1,302 @@
++import Foundation
++
++public struct GramPotMemberID: Hashable, Sendable, Codable, RawRepresentable {
++    public var rawValue: Int64
++
++    public init(rawValue: Int64) {
++        self.rawValue = rawValue
++    }
++}
++
++public enum GramPotPhase: String, Sendable, Equatable, Codable {
++    /// Created, price locked, nobody has chipped in.
++    case open
++    /// At least one spot is paid and the pot is not full.
++    case filling
++    /// The spots sum to the price. Escrow is spent on the gift. Not refunded.
++    case complete
++    /// A snapshotted member left before the pot filled. Every contribution was credited back.
++    case refunded
++    /// 24 hours passed before the pot filled. Every contribution was credited back.
++    case expired
++}
++
++public enum GramPotError: Error, Equatable, Sendable {
++    case invalidPrice
++    case invalidRate
++    case recipientNotInGroup
++    case duplicateMember
++    case noSpots
++    case timestampOverflow
++    case closed
++    case expired
++    case isRecipient
++    case notAMember
++    case alreadyContributed
++    case wrongAmount
++    case insufficientBalance
++}
++
++/// A change to someone's Telegram GRAM wallet, or to the escrow that wallet was debited into.
++///
++/// `.debit` is the Chip in tap: that member's wallet pays the spot into escrow.
++/// `.credit` is the refund of that debit, back to the same wallet.
++/// `.spendEscrow` buys the gift from escrow. It does not debit a wallet again.
++public struct GramPotWalletEffect: Equatable, Sendable {
++    public enum Kind: Equatable, Sendable {
++        case debit
++        case credit
++        case spendEscrow
++    }
++
++    public var kind: Kind
++    /// Nil for `.spendEscrow`, which is not a wallet movement.
++    public var memberId: GramPotMemberID?
++    public var nano: Int64
++
++    public init(kind: Kind, memberId: GramPotMemberID?, nano: Int64) {
++        self.kind = kind
++        self.memberId = memberId
++        self.nano = nano
++    }
++}
++
++/// What a call did. `error` is set when the requested action was refused.
++/// `effects` are still applied in that case when the pot had to expire in order to refuse.
++public struct GramPotTransition: Equatable, Sendable {
++    public var effects: [GramPotWalletEffect]
++    public var error: GramPotError?
++
++    public init(effects: [GramPotWalletEffect], error: GramPotError?) {
++        self.effects = effects
++        self.error = error
++    }
++
++    public var succeeded: Bool {
++        self.error == nil
++    }
++}
++
++public struct GramPotContribution: Equatable, Sendable, Codable {
++    public var memberId: GramPotMemberID
++    public var nano: Int64
++
++    public init(memberId: GramPotMemberID, nano: Int64) {
++        self.memberId = memberId
++        self.nano = nano
++    }
++}
++
++/// One pot. The price, the fiat rate, and the member list are locked at the start.
++/// Chip-in debits a wallet into escrow. Start itself does not.
++public struct GramPot: Equatable, Sendable {
++    public static let deadlineInterval: Int64 = 86_400
++
++    public let id: Int64
++    public let priceNano: Int64
++    public let microUsdPerGram: Int64
++    public let recipientId: GramPotMemberID
++    /// Snapshot order, including the recipient.
++    public let memberIds: [GramPotMemberID]
++    public let createdAt: Int64
++    /// Payers in snapshot order, recipient excluded. Earliest spots take the remainder nano.
++    public let spotOrder: [GramPotMemberID]
++    public let spotAmounts: [GramPotMemberID: Int64]
++    public private(set) var contributions: [GramPotContribution]
++    public private(set) var phase: GramPotPhase
++
++    public var deadline: Int64 {
++        self.createdAt + GramPot.deadlineInterval
++    }
++
++    public var contributedNano: Int64 {
++        self.contributions.reduce(0) { $0 + $1.nano }
++    }
++
++    public static func start(
++        id: Int64,
++        priceNano: Int64,
++        microUsdPerGram: Int64,
++        recipientId: GramPotMemberID,
++        memberIds: [GramPotMemberID],
++        createdAt: Int64
++    ) -> Result<GramPot, GramPotError> {
++        guard priceNano > 0 else {
++            return .failure(.invalidPrice)
++        }
++        guard microUsdPerGram >= 0 else {
++            return .failure(.invalidRate)
++        }
++        guard memberIds.contains(recipientId) else {
++            return .failure(.recipientNotInGroup)
++        }
++        var seen: Set<GramPotMemberID> = []
++        for memberId in memberIds {
++            if seen.contains(memberId) {
++                return .failure(.duplicateMember)
++            }
++            seen.insert(memberId)
++        }
++        let spotOrder = memberIds.filter { $0 != recipientId }
++        guard !spotOrder.isEmpty else {
++            return .failure(.noSpots)
++        }
++        guard let amounts = gramPotEqualSpotAmounts(priceNano: priceNano, spotCount: spotOrder.count) else {
++            return .failure(.invalidPrice)
++        }
++        let (_, overflow) = createdAt.addingReportingOverflow(deadlineInterval)
++        if overflow {
++            return .failure(.timestampOverflow)
++        }
++        var spotAmounts: [GramPotMemberID: Int64] = [:]
++        for (memberId, amount) in zip(spotOrder, amounts) {
++            spotAmounts[memberId] = amount
++        }
++        let pot = GramPot(
++            id: id,
++            priceNano: priceNano,
++            microUsdPerGram: microUsdPerGram,
++            recipientId: recipientId,
++            memberIds: memberIds,
++            createdAt: createdAt,
++            spotOrder: spotOrder,
++            spotAmounts: spotAmounts,
++            contributions: [],
++            phase: .open
++        )
++        return .success(pot)
++    }
++
++    /// One Chip in tap. Debits `memberId`'s wallet by the locked spot when `balanceNano` covers it.
++    /// A tap after the deadline expires the pot and refunds what was already held.
++    public mutating func chipIn(
++        memberId: GramPotMemberID,
++        nano: Int64,
++        balanceNano: Int64,
++        now: Int64
++    ) -> GramPotTransition {
++        if self.isTerminal {
++            return GramPotTransition(effects: [], error: .closed)
++        }
++        if now >= self.deadline {
++            return self.expire(refusingChipIn: true)
++        }
++        guard let expected = self.spotAmounts[memberId] else {
++            if memberId == self.recipientId {
++                return GramPotTransition(effects: [], error: .isRecipient)
++            }
++            return GramPotTransition(effects: [], error: .notAMember)
++        }
++        if self.contributions.contains(where: { $0.memberId == memberId }) {
++            return GramPotTransition(effects: [], error: .alreadyContributed)
++        }
++        if nano != expected {
++            return GramPotTransition(effects: [], error: .wrongAmount)
++        }
++        if balanceNano < nano {
++            return GramPotTransition(effects: [], error: .insufficientBalance)
++        }
++        self.contributions.append(GramPotContribution(memberId: memberId, nano: nano))
++        var effects = [GramPotWalletEffect(kind: .debit, memberId: memberId, nano: nano)]
++        if self.contributedNano == self.priceNano {
++            self.phase = .complete
++            effects.append(GramPotWalletEffect(kind: .spendEscrow, memberId: nil, nano: self.priceNano))
++        } else {
++            self.phase = .filling
++        }
++        return GramPotTransition(effects: effects, error: nil)
++    }
++
++    /// A snapshotted member leaving while the pot is open or filling refunds everyone. No resplit.
++    /// Leaving after complete, refund, or expiry does nothing. Someone who was not in the snapshot does nothing.
++    public mutating func memberLeft(memberId: GramPotMemberID, now: Int64) -> GramPotTransition {
++        if self.isTerminal {
++            return GramPotTransition(effects: [], error: nil)
++        }
++        if now >= self.deadline {
++            return self.expire(refusingChipIn: false)
++        }
++        guard self.memberIds.contains(memberId) else {
++            return GramPotTransition(effects: [], error: nil)
++        }
++        let effects = self.takeRefunds()
++        self.phase = .refunded
++        return GramPotTransition(effects: effects, error: nil)
++    }
++
++    /// Moves an open or filling pot to expired once `now` reaches the deadline, and refunds.
++    public mutating func advance(now: Int64) -> GramPotTransition {
++        if self.isTerminal || now < self.deadline {
++            return GramPotTransition(effects: [], error: nil)
++        }
++        return self.expire(refusingChipIn: false)
++    }
++
++    /// Signed nano delta for one wallet. Debit is negative, credit is positive.
++    /// Escrow spend is not a wallet movement: the wallet was already debited at chip-in.
++    public static func localWalletDelta(effects: [GramPotWalletEffect], localMemberId: GramPotMemberID) -> Int64 {
++        var delta: Int64 = 0
++        for effect in effects {
++            guard effect.memberId == localMemberId else {
++                continue
++            }
++            switch effect.kind {
++            case .debit:
++                delta -= effect.nano
++            case .credit:
++                delta += effect.nano
++            case .spendEscrow:
++                break
++            }
++        }
++        return delta
++    }
++
++    private var isTerminal: Bool {
++        switch self.phase {
++        case .complete, .refunded, .expired:
++            return true
++        case .open, .filling:
++            return false
++        }
++    }
++
++    private mutating func expire(refusingChipIn: Bool) -> GramPotTransition {
++        let effects = self.takeRefunds()
++        self.phase = .expired
++        return GramPotTransition(effects: effects, error: refusingChipIn ? .expired : nil)
++    }
++
++    private mutating func takeRefunds() -> [GramPotWalletEffect] {
++        let effects = self.contributions.map { contribution in
++            GramPotWalletEffect(kind: .credit, memberId: contribution.memberId, nano: contribution.nano)
++        }
++        self.contributions = []
++        return effects
++    }
++}
++
++/// Holds GRAM between the wallet debit and either the purchase or the refund.
++public struct GramPotEscrow: Equatable, Sendable {
++    public private(set) var heldNano: Int64
++    public private(set) var spentNano: Int64
++
++    public init(heldNano: Int64 = 0, spentNano: Int64 = 0) {
++        self.heldNano = heldNano
++        self.spentNano = spentNano
++    }
++
++    public mutating func apply(_ effects: [GramPotWalletEffect]) {
++        for effect in effects {
++            switch effect.kind {
++            case .debit:
++                self.heldNano += effect.nano
++            case .credit:
++                self.heldNano -= effect.nano
++            case .spendEscrow:
++                self.heldNano -= effect.nano
++                self.spentNano += effect.nano
++            }
++        }
++    }
++}
+diff -ruN a/submodules/TelegramUI/Components/Gifts/PeerTableCellComponent/Sources/PeerTableCellComponent.swift b/submodules/TelegramUI/Components/Gifts/PeerTableCellComponent/Sources/PeerTableCellComponent.swift
+--- a/submodules/TelegramUI/Components/Gifts/PeerTableCellComponent/Sources/PeerTableCellComponent.swift	2026-10-23 15:21:59.565214312 +0000
++++ b/submodules/TelegramUI/Components/Gifts/PeerTableCellComponent/Sources/PeerTableCellComponent.swift	2026-10-23 15:21:59.633214263 +0000
+@@ -13,17 +13,20 @@
+     let theme: PresentationTheme
+     let strings: PresentationStrings
+     let peer: EnginePeer?
++    let showsAvatar: Bool
+ 
+     public init(
+         context: AccountContext,
+         theme: PresentationTheme,
+         strings: PresentationStrings,
+-        peer: EnginePeer?
++        peer: EnginePeer?,
++        showsAvatar: Bool = true
+     ) {
+         self.context = context
+         self.theme = theme
+         self.strings = strings
+         self.peer = peer
++        self.showsAvatar = showsAvatar
+     }
+ 
+     public static func ==(lhs: PeerTableCellComponent, rhs: PeerTableCellComponent) -> Bool {
+@@ -39,6 +42,9 @@
+         if lhs.peer != rhs.peer {
+             return false
+         }
++        if lhs.showsAvatar != rhs.showsAvatar {
++            return false
++        }
+         return true
+     }
+ 
+@@ -65,8 +71,9 @@
+             self.component = component
+             self.state = state
+                                     
+-            let avatarSize = CGSize(width: 22.0, height: 22.0)
+-            let spacing: CGFloat = 6.0
++            let avatarSize = component.showsAvatar ? CGSize(width: 22.0, height: 22.0) : CGSize()
++            let spacing: CGFloat = component.showsAvatar ? 6.0 : 0.0
++            self.avatarNode.isHidden = !component.showsAvatar
+             
+             var peerName: String
+             let avatarOverride: AvatarNodeImageOverride?
+diff -ruN a/submodules/TelegramUI/Components/TelegramUIDeclareEncodables/Sources/TelegramUIDeclareEncodables.swift b/submodules/TelegramUI/Components/TelegramUIDeclareEncodables/Sources/TelegramUIDeclareEncodables.swift
+--- a/submodules/TelegramUI/Components/TelegramUIDeclareEncodables/Sources/TelegramUIDeclareEncodables.swift	2026-10-23 15:21:59.573214306 +0000
++++ b/submodules/TelegramUI/Components/TelegramUIDeclareEncodables/Sources/TelegramUIDeclareEncodables.swift	2026-10-23 15:21:59.633214263 +0000
+@@ -20,6 +20,7 @@
+     engineDeclareEncodable(LocalFileGifMediaResource.self, f: { LocalFileGifMediaResource(decoder: $0) })
+     engineDeclareEncodable(PhotoLibraryMediaResource.self, f: { PhotoLibraryMediaResource(decoder: $0) })
+     engineDeclareEncodable(ICloudFileResource.self, f: { ICloudFileResource(decoder: $0) })
++    gramPotDeclareMessageAttribute()
+     return
+ }()
+ 
+diff -ruN a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
+--- a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift	2026-10-23 15:21:59.577214304 +0000
++++ b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift	2026-10-23 15:21:59.653214248 +0000
+@@ -1835,6 +1835,9 @@
+             }, openChatTheme: nil, dismissed: {
+                 dismissedImpl?()
+             })
++            if case let .chat(groupPeerId, message, _) = urlContext, let giftScreen = controller as? GramPotGiftScreen {
++                giftScreen.gramPotSetOrigin(groupPeerId: groupPeerId, messageId: message?.id, recipientId: message?.author?.id)
++            }
+             navigationController?.pushViewController(controller)
+             
+             if let storyProgressPauseContext = contentContext as? StoryProgressPauseContext {
+diff -ruN a/Telegram/Telegram-iOS/en.lproj/Localizable.strings b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+--- a/Telegram/Telegram-iOS/en.lproj/Localizable.strings	2026-10-23 15:21:59.581214300 +0000
++++ b/Telegram/Telegram-iOS/en.lproj/Localizable.strings	2026-10-23 15:21:59.657214245 +0000
+@@ -17243,3 +17243,22 @@
+ "Gift.Delete.Title" = "Delete Gift";
+ "Gift.Delete.Text" = "Do you want to delete this gift?\n\nIt will disappear from your profile and can't be restored.";
+ "Gift.Delete.Success" = "Gift Deleted";
++
++"GramPot.Menu" = "Gram Pot";
++"GramPot.Menu.New" = "New";
++"GramPot.Title" = "Gram Pot for %@";
++"GramPot.YoureFirst" = "you're first";
++"GramPot.Held" = "GRAM is held in the pot · refunded if it isn't full in 24 h";
++"GramPot.SplitWays" = "Split %@ ways";
++"GramPot.Balance" = "Balance %@ GRAM";
++"GramPot.ChipIn" = "Chip in %@";
++"GramPot.Started" = "%1$@ started a Gram Pot for %2$@";
++"GramPot.ChippedIn" = "%1$@ chipped in %2$@";
++"GramPot.Complete" = "Gram Pot complete · %@ received the gift";
++"GramPot.GiftFromFriends" = "Gift from %@ friends";
++"GramPot.GiftFromLine" = "A gift from %@ via Gram Pot.";
++"GramPot.Done" = "Done";
++"GramPot.NotEnough" = "Not enough GRAM";
++"GramPot.Unavailable" = "Gram Pot isn't available for this gift";
++"GramPot.SentYou" = "%@ sent you a gift via Gram Pot";
++"GramPot.Help" = "Friends chip in equal amounts from their GRAM balance. Telegram holds the GRAM until the pot is full, then buys the gift. If someone leaves, or it is not full in 24 h, everyone is refunded.";
