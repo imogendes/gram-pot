@@ -1,0 +1,23 @@
+Gram Pot
+
+The notes in this repository (README.md and docs/) are published the same
+way as https://github.com/imogendes/make-an-offer, which ships no separate
+license file.
+
+The standalone GramPotLogic package under GramPotLogic/ is original work
+for this prototype and is published on the same terms as those notes: you
+may read it, use it, and share it together with this repository.
+
+Source under submodules/ and Telegram/, and the patch gram-pot.patch, are
+derived from Telegram-iOS:
+
+    https://github.com/TelegramMessenger/Telegram-iOS
+
+Telegram-iOS requires that published code comply with its licence. Those
+files are covered by the GNU General Public License, version 2. The licence
+text is the one in Telegram-iOS:
+
+    https://github.com/TelegramMessenger/Telegram-iOS/blob/master/LICENSE
+
+This file does not change Telegram's terms and does not add a copyright
+assignment.
